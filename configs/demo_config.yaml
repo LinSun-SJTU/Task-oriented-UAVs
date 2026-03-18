@@ -1,0 +1,42 @@
+environment:
+  n_uavs: 5
+  world_size: [24.0, 24.0, 24.0]
+  min_space_size: 1.0   # 仅用于未配置 margin_size 时计算 margin_size = min_space_size/2
+  max_space_size: 5.0
+  # margin_size 不写则代码中取 min_space_size/2；实际可分配 min = 4*margin_size
+  priority_range: [0.1, 1.0]
+  urgency_range: [0.0, 1.0]
+
+algorithm:
+  name: "MAPPO"
+  actor_lr: 0.0003
+  critic_lr: 0.001
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_epsilon: 0.2
+  ppo_epochs: 10
+  batch_size: 64
+  hidden_dim: 64
+
+training:
+  n_episodes: 500       # Demo 规模，可按需增大
+  max_steps: 100
+  update_freq: 50        # 每采集 100 个 episode 更新一次
+  save_freq: 50
+  save_dir: "checkpoints"
+
+safety:
+  buffer: 0.1
+
+# 可插拔导航：不配置或 type 为空则随机移动；接入后空间分配不干预导航
+navigation:
+  type: "astar"
+  grid_resolution: 1.0
+  step_size: 2.5
+
+reward_weights:
+  task_weight: 1.0
+  safety_weight: 0
+  efficiency_weight: 0
+
+
