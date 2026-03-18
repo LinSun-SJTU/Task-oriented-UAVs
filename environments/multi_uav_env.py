@@ -1,22 +1,16 @@
 import numpy as np
-from typing import Dict, Tuple, Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from safety.safe_layer import SafeProjectionLayer
+from tasks.scheduler import greedy_assign_pending_tasks
+from tasks.task import Task, TaskGenerator
 
 
 class MultiUAVEnv:
     """
-    5 架无人机的协作空域管理环境（简化版 Demo）
-
-    核心功能：
-    1. 生成初始任务属性 (priority, urgency)
-    2. 执行动作（调整独占空间大小）
-    3. 计算奖励（任务奖励 + 安全 / 效率奖励）
-    4. 更新状态（任务进度、无人机位置）
-
-    说明：
-    - 独占空间用球形或等边立方体的“边长/直径”等价标量 size 表示
-    - 安全检查基于球形近似，使用安全缓冲区避免重叠
+    多无人机协作空域：可选「任务池 + 规则调度」模式。
+    - 传统模式：reset 时每机给定起点/终点，全程 active。
+    - 调度模式：任务动态到达；inactive 在停机位；分配后在任务起点 spawn，飞往终点。
     """
 
     def __init__(
@@ -34,177 +28,307 @@ class MultiUAVEnv:
         efficiency_weight: float = 0.1,
         random_seed: int = 0,
         navigator: Optional[Any] = None,
+        task_scheduler: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.rng = np.random.RandomState(random_seed)
         self.navigator = navigator
 
-        # 基础参数
         self.n_uavs = n_uavs
         self.world_size = np.array(world_size, dtype=float)
-        self.space_dim = 3  # 3D 空间
+        self.space_dim = 3
         self.min_space_size = float(min_space_size)
         self.max_space_size = float(max_space_size)
-
-        # 任务属性范围
         self.priority_range = priority_range
         self.urgency_range = urgency_range
 
-        # 奖励权重
         self.task_weight = task_weight
         self.completion_bonus = float(completion_bonus)
         self.safety_weight = safety_weight
         self.efficiency_weight = efficiency_weight
 
-        # 状态空间：每个无人机观测
-        # [pos_x, pos_y, pos_z, priority, urgency, progress,
-        #  neighbor_dist_1, neighbor_dist_2, ...]
-        self.obs_dim = 6 + (self.n_uavs - 1)
+        ts = task_scheduler or {}
+        self.task_scheduler_enabled = bool(ts.get("enabled", False))
+        self._task_scheduler_cfg = ts
 
-        # 动作空间：[-1, 1] -> 通过映射变为空间缩放因子
+        # [pos(3), p, u, progress, active_flag, dist_to_others...]
+        self.obs_dim = 7 + (self.n_uavs - 1)
         self.action_dim = 1
 
-        # 安全层（与环境共用 min/max 空间边界，不再单独配置）
         self.safety_layer = SafeProjectionLayer(
             min_size=self.min_space_size,
             max_size=self.max_space_size,
             buffer=safety_buffer,
         )
 
-        # 运行时状态
-        self.positions: np.ndarray = np.zeros((self.n_uavs, 3), dtype=float)
-        self.target_positions: np.ndarray = np.zeros((self.n_uavs, 3), dtype=float)
-        self.priorities: np.ndarray = np.zeros(self.n_uavs, dtype=float)
-        self.urgencies: np.ndarray = np.zeros(self.n_uavs, dtype=float)
-        self.space_sizes: np.ndarray = np.ones(self.n_uavs, dtype=float)
-        self.task_progress: np.ndarray = np.zeros(self.n_uavs, dtype=float)
-        self.start_positions: np.ndarray = np.zeros((self.n_uavs, 3), dtype=float)  # reset 时起点，用于投影
-        self.max_projection_ratio: np.ndarray = np.zeros(self.n_uavs, dtype=float)  # 历史最大投影占比 [0,1]
+        self.positions = np.zeros((self.n_uavs, 3), dtype=float)
+        self.target_positions = np.zeros((self.n_uavs, 3), dtype=float)
+        self.priorities = np.zeros(self.n_uavs, dtype=float)
+        self.urgencies = np.zeros(self.n_uavs, dtype=float)
+        self.space_sizes = np.ones(self.n_uavs, dtype=float)
+        self.task_progress = np.zeros(self.n_uavs, dtype=float)
+        self.start_positions = np.zeros((self.n_uavs, 3), dtype=float)
+        self.max_projection_ratio = np.zeros(self.n_uavs, dtype=float)
+        self.active = np.ones(self.n_uavs, dtype=bool)
 
-    # 便于 MAPPO critic 的 global_obs 维度
+        self.task_pool: List[Task] = []
+        self._episode_step = -1
+        self._tasks_completed_episode = 0
+        self._depot_positions = self._make_depot_positions()
+        self._initial_tasks_injected = False
+
+        self._task_generator: Optional[TaskGenerator] = None
+        if self.task_scheduler_enabled:
+            m = float(ts.get("margin", 2.0))
+            self._task_generator = TaskGenerator(
+                rng=self.rng,
+                world_size=self.world_size,
+                margin=m,
+                priority_range=tuple(ts.get("priority_range", list(priority_range))),
+                urgency_range=tuple(ts.get("urgency_range", list(urgency_range))),
+                arrival_every_n_steps=int(ts.get("arrival_every_n_steps", 30)),
+                tasks_per_arrival=int(ts.get("tasks_per_arrival", 1)),
+                min_seg_len=float(ts.get("min_seg_len", 3.0)),
+                deadline_steps=ts.get("deadline_steps"),  # None ok
+            )
+
+    def _make_depot_positions(self) -> np.ndarray:
+        w = self.world_size
+        m = 2.0
+        starts = np.array(
+            [
+                [m, m, m],
+                [w[0] - m, m, m],
+                [m, w[1] - m, m],
+                [w[0] - m, w[1] - m, m],
+                [w[0] * 0.5, w[1] * 0.5, w[2] * 0.5],
+            ],
+            dtype=float,
+        )
+        dep = np.zeros((self.n_uavs, 3), dtype=float)
+        for i in range(self.n_uavs):
+            base = starts[i % len(starts)]
+            dep[i] = base + self.rng.uniform(-0.3, 0.3, size=3)
+        return np.clip(dep, 0.0, self.world_size)
+
     @property
     def global_obs_dim(self) -> int:
-        # 简单做法：拼接所有局部观测
         return self.n_uavs * self.obs_dim
 
-    # ====== Gym-like API ====== #
     def reset(self) -> np.ndarray:
-        """重置环境，初始化无人机起点与目标（分散）、任务属性。"""
+        self._episode_step = -1
+        self._tasks_completed_episode = 0
+        self._initial_tasks_injected = False
+        if self.task_scheduler_enabled:
+            self.task_pool = []
+            if self._task_generator is not None:
+                self._task_generator.reset()
+            self.active[:] = False
+            self.positions = self._depot_positions.copy()
+            self.start_positions = self.positions.copy()
+            self.target_positions = self.positions.copy()
+            self.priorities[:] = 0.0
+            self.urgencies[:] = 0.0
+            self.space_sizes[:] = self.min_space_size
+            self.max_projection_ratio[:] = 0.0
+            self.task_progress[:] = 0.0
+            return self._get_obs()
+
+        # 传统模式：全 active，固定起点终点
         w = self.world_size
         margin = 2.0
-        # 1. 起点：在空间内分散布置（角点/边+中心附近），加小随机偏移
-        #准备了一组起点和终点列表，然后无人机按照编号取模循环使用这些点
-        starts = np.array([
-            [margin, margin, margin],
-            [w[0] - margin, margin, margin],
-            [margin, w[1] - margin, margin],
-            [w[0] - margin, w[1] - margin, margin],
-            [w[0] * 0.5, w[1] * 0.5, w[2] * 0.5],
-        ], dtype=float)
+        starts = np.array(
+            [
+                [margin, margin, margin],
+                [w[0] - margin, margin, margin],
+                [margin, w[1] - margin, margin],
+                [w[0] - margin, w[1] - margin, margin],
+                [w[0] * 0.5, w[1] * 0.5, w[2] * 0.5],
+            ],
+            dtype=float,
+        )
         for i in range(self.n_uavs):
             base = starts[i % len(starts)]
             self.positions[i] = base + self.rng.uniform(-0.5, 0.5, size=3)
         self.positions = np.clip(self.positions, 0.0, self.world_size)
-
-        # 2. 目标点：与起点错开，分散在另一侧/对角
-        targets = np.array([
-            [w[0] - margin, w[1] - margin, w[2] - margin],
-            [margin, w[1] - margin, w[2] - margin],
-            [w[0] - margin, margin, w[2] - margin],
-            [margin, margin, w[2] - margin],
-            [w[0] * 0.5, w[1] * 0.5, margin],
-        ], dtype=float)
+        targets = np.array(
+            [
+                [w[0] - margin, w[1] - margin, w[2] - margin],
+                [margin, w[1] - margin, w[2] - margin],
+                [w[0] - margin, margin, w[2] - margin],
+                [margin, margin, w[2] - margin],
+                [w[0] * 0.5, w[1] * 0.5, margin],
+            ],
+            dtype=float,
+        )
         for i in range(self.n_uavs):
-            self.target_positions[i] = targets[i % len(targets)] + self.rng.uniform(-0.3, 0.3, size=3)
+            self.target_positions[i] = targets[i % len(targets)] + self.rng.uniform(
+                -0.3, 0.3, size=3
+            )
         self.target_positions = np.clip(self.target_positions, 0.0, self.world_size)
-
-        # 3. 任务属性
-        # 在初始设置的优先级取值范围内均匀取一组赋值到任务上
         self.priorities = self.rng.uniform(
             self.priority_range[0], self.priority_range[1], size=self.n_uavs
         )
         self.urgencies = self.rng.uniform(
             self.urgency_range[0], self.urgency_range[1], size=self.n_uavs
         )
-
-        # 4. 初始化独占空间大小（min 下 half_nav 仍 > 0，可直接从 min 起步）
-        self.space_sizes = np.ones(self.n_uavs, dtype=float) * self.min_space_size
-
-        # 5. 任务进度：起点-终点连线上的投影占比，取历史最大（只认“沿连线推进”，不认绕路）
+        self.space_sizes[:] = self.min_space_size
         self.start_positions = self.positions.copy()
         seg_len = np.linalg.norm(self.target_positions - self.start_positions, axis=1)
-        self.max_projection_ratio = np.where(seg_len < 1e-6, 1.0, 0.0)  # 起点即终点视为已到达
+        self.max_projection_ratio = np.where(seg_len < 1e-6, 1.0, 0.0)
         self.task_progress = self.max_projection_ratio.copy()
-
+        self.active[:] = True
         return self._get_obs()
 
-    def step(self, actions: np.ndarray) -> Tuple[np.ndarray, np.ndarray, bool, Dict]:
-        """
-        执行一步动作。
+    def _deactivate_uav(self, i: int) -> None:
+        self.active[i] = False
+        self.positions[i] = self._depot_positions[i].copy()
+        self.start_positions[i] = self.positions[i].copy()
+        self.target_positions[i] = self.positions[i].copy()
+        self.priorities[i] = 0.0
+        self.urgencies[i] = 0.0
+        self.space_sizes[i] = self.min_space_size
+        self.max_projection_ratio[i] = 0.0
+        self.task_progress[i] = 0.0
 
-        参数
-        ----
-        actions: [n_uavs] 或 [n_uavs, 1]，取值范围大致在 [-1, 1]
-        """
+    def _assign_task_to_uav(self, i: int, task: Task) -> None:
+        task.status = "in_progress"
+        task.assigned_uav_id = i
+        self.active[i] = True
+        self.positions[i] = np.clip(task.start.copy(), 0.0, self.world_size)
+        self.start_positions[i] = self.positions[i].copy()
+        self.target_positions[i] = np.clip(task.goal.copy(), 0.0, self.world_size)
+        self.priorities[i] = float(task.priority)
+        self.urgencies[i] = float(task.urgency)
+        self.space_sizes[i] = self.min_space_size
+        self.max_projection_ratio[i] = 0.0
+        self.task_progress[i] = 0.0
+        seg = np.linalg.norm(self.target_positions[i] - self.start_positions[i])
+        if seg < 1e-6:
+            self.max_projection_ratio[i] = 1.0
+            self.task_progress[i] = 1.0
+
+    def _scheduler_tick(self) -> None:
+        assert self._task_generator is not None
+        # episode 第 0 步一次性注入初始任务，用于开局激活更多 UAV
+        if (not self._initial_tasks_injected) and self._episode_step == 0:
+            init_n = int(self._task_scheduler_cfg.get("initial_tasks", 0) or 0)
+            if init_n > 0:
+                self.task_pool.extend(self._task_generator.spawn_n(init_n))
+            self._initial_tasks_injected = True
+
+        new_tasks = self._task_generator.step(self._episode_step)
+        self.task_pool.extend(new_tasks)
+
+        for t in self.task_pool:
+            if t.status == "pending" and t.deadline_remaining is not None:
+                t.deadline_remaining -= 1
+                if t.deadline_remaining <= 0:
+                    t.status = "expired"
+
+        for i in range(self.n_uavs):
+            if not self.active[i]:
+                continue
+            if self.task_progress[i] >= 0.95:
+                for tk in self.task_pool:
+                    if tk.assigned_uav_id == i and tk.status == "in_progress":
+                        tk.status = "done"
+                        self._tasks_completed_episode += 1
+                        break
+                self._deactivate_uav(i)
+
+        assigns = greedy_assign_pending_tasks(
+            self.task_pool, self.n_uavs, self.active
+        )
+        for uav_i, task in assigns:
+            self._assign_task_to_uav(uav_i, task)
+
+    def step(self, actions: np.ndarray) -> Tuple[np.ndarray, np.ndarray, bool, Dict]:
         actions = np.asarray(actions, dtype=float).reshape(self.n_uavs, -1)
+        info: Dict[str, Any] = {}
+
+        if self.task_scheduler_enabled:
+            self._episode_step += 1
+            self._scheduler_tick()
 
         prev_progress = self.task_progress.copy()
 
-        # 1. 先移动：导航更新位置，每轮动完再保证安全
-        if self.navigator is not None:
-            movements = self.navigator.compute_movements(
-                self.positions, self.target_positions, self.world_size
-            )
-        else:
-            movements = self.rng.normal(0.0, 0.1, size=(self.n_uavs, 3))
-        # 单步位移限制在安全空间内（中心不超出当前 space_sizes 对应立方体）
+        act_mask = self.active.copy()
+        if not self.task_scheduler_enabled:
+            act_mask[:] = True
+
+        movements = np.zeros((self.n_uavs, 3), dtype=float)
+        if act_mask.any():
+            if self.navigator is not None:
+                movements_all = self.navigator.compute_movements(
+                    self.positions, self.target_positions, self.world_size
+                )
+            else:
+                movements_all = self.rng.normal(0.0, 0.1, size=(self.n_uavs, 3))
+            movements[act_mask] = movements_all[act_mask]
+
         half_nav = self.space_sizes / 2.0
         max_axis = np.max(np.abs(movements), axis=1)
         scale = np.minimum(1.0, half_nav / np.maximum(max_axis, 1e-9))
         movements = movements * scale[:, np.newaxis]
         self.positions = np.clip(self.positions + movements, 0.0, self.world_size)
 
-        # 下一步校验：任意两机中心满足 max(sep) >= min_space_size + buffer，避免都压到 min 时仍重叠
-        self._enforce_min_separation()
+        self._enforce_min_separation_active_only(act_mask)
 
-        # 2. 安全投影（原始动作 → proposed_sizes → 按 priority×urgency 冲突解决）
         self.space_sizes, safe_actions, proposed_sizes = self.safety_layer.safety_projection(
             actions, self._get_state()
         )
+        proposed_sizes = np.asarray(proposed_sizes, dtype=float).reshape(-1).copy()
+        for i in range(self.n_uavs):
+            if not act_mask[i]:
+                self.space_sizes[i] = self.min_space_size
+                safe_actions[i] = np.array([-1.0], dtype=float)
+                proposed_sizes[i] = self.min_space_size
         self.space_sizes = np.clip(
             self.space_sizes, self.min_space_size, self.max_space_size
         )
 
-        # 3. 任务进度 = 当前点到起点-终点连线投影占比，取历史最大（沿连线推进才涨进度）
-        diff = self.target_positions - self.start_positions  # (n_uavs, 3)
-        L_sq = np.sum(diff ** 2, axis=1)
-        L_sq = np.maximum(L_sq, 1e-12)
-        t = np.sum((self.positions - self.start_positions) * diff, axis=1) / L_sq
-        t = np.clip(t, 0.0, 1.0)
-        self.max_projection_ratio = np.maximum(self.max_projection_ratio, t)
-        self.task_progress = self.max_projection_ratio.copy()
+        for i in range(self.n_uavs):
+            if not act_mask[i]:
+                self.task_progress[i] = 0.0
+                self.max_projection_ratio[i] = 0.0
+                continue
+            diff = self.target_positions[i] - self.start_positions[i]
+            L_sq = float(np.sum(diff ** 2))
+            L_sq = max(L_sq, 1e-12)
+            t = float(
+                np.sum((self.positions[i] - self.start_positions[i]) * diff)
+            ) / L_sq
+            t = float(np.clip(t, 0.0, 1.0))
+            self.max_projection_ratio[i] = max(float(self.max_projection_ratio[i]), t)
+            self.task_progress[i] = self.max_projection_ratio[i]
 
-        # 4. 计算奖励
         delta_progress = np.maximum(0.0, self.task_progress - prev_progress)
-        completed_now = (self.task_progress >= 0.95) & (prev_progress < 0.95)
+        completed_now = (self.task_progress >= 0.95) & (prev_progress < 0.95) & act_mask
         rewards = self._calculate_rewards(
             safe_actions,
             proposed_sizes,
             delta_progress=delta_progress,
             completed_now=completed_now,
+            active_mask=act_mask,
         )
 
-        # 5. 终止与已完成机空间：用同一阈值 0.95，避免分开两次判断产生偏差
-        completed = self.task_progress >= 0.95
-        self.space_sizes[completed] = self.min_space_size
-        done = bool(np.mean(self.task_progress) >= 0.95)
+        if self.task_scheduler_enabled:
+            done = False
+            info["tasks_completed"] = self._tasks_completed_episode
+            info["n_pending"] = sum(1 for t in self.task_pool if t.status == "pending")
+        else:
+            completed = self.task_progress >= 0.95
+            self.space_sizes[completed] = self.min_space_size
+            done = bool(np.mean(self.task_progress) >= 0.95)
+
+        if not self.task_scheduler_enabled:
+            completed = self.task_progress >= 0.95
+            self.space_sizes[completed] = self.min_space_size
 
         obs = self._get_obs()
-        info: Dict[str, Any] = {}
         return obs, rewards, done, info
 
-    # ====== 状态与奖励 ====== #
     def _get_state(self) -> Dict[str, np.ndarray]:
-        """供安全层使用的全局状态（含 priorities/urgencies 时启用按优先级每机缩放）。"""
         return {
             "positions": self.positions.copy(),
             "space_sizes": self.space_sizes.copy(),
@@ -212,11 +336,7 @@ class MultiUAVEnv:
             "urgencies": self.urgencies.copy(),
         }
 
-    def _enforce_min_separation(self) -> None:
-        """
-        下一步校验：保证任意两机满足 max(sep) >= min_space_size + buffer，
-        避免两架都压到 min 时安全空间仍重叠。违反时将低 priority×urgency 的一方向外推。
-        """
+    def _enforce_min_separation_active_only(self, act_mask: np.ndarray) -> None:
         n = self.n_uavs
         if n <= 1:
             return
@@ -227,6 +347,8 @@ class MultiUAVEnv:
             changed = False
             for i in range(n):
                 for j in range(i + 1, n):
+                    if not (act_mask[i] and act_mask[j]):
+                        continue
                     sep = np.abs(self.positions[i] - self.positions[j])
                     max_sep = float(np.max(sep))
                     if max_sep >= min_sep or max_sep < 1e-9:
@@ -249,46 +371,34 @@ class MultiUAVEnv:
                 break
 
     def _get_obs(self) -> np.ndarray:
-        """获取每个无人机的局部观测。"""
         obs_list = []
         for i in range(self.n_uavs):
-            # 自身状态
+            if self.active[i]:
+                pos = self.positions[i]
+                p, u, pr = self.priorities[i], self.urgencies[i], self.task_progress[i]
+                af = 1.0
+            else:
+                pos = np.zeros(3, dtype=float)
+                p, u, pr = 0.0, 0.0, 0.0
+                af = 0.0
             self_state = np.concatenate(
                 [
-                    self.positions[i],
-                    np.array(
-                        [
-                            self.priorities[i],
-                            self.urgencies[i],
-                            self.task_progress[i],
-                        ],
-                        dtype=float,
-                    ),
+                    pos,
+                    np.array([p, u, pr, af], dtype=float),
                 ]
             )
-
-            # 与其他无人机的距离
             distances = []
             for j in range(self.n_uavs):
                 if i == j:
                     continue
                 dist = np.linalg.norm(self.positions[i] - self.positions[j])
-                distances.append(dist)
-
+                distances.append(float(dist))
             obs_i = np.concatenate([self_state, np.array(distances, dtype=float)])
             obs_list.append(obs_i)
-
         return np.vstack(obs_list)
 
     def _get_global_obs(self) -> np.ndarray:
-        """
-        获取全局观测（供 MAPPO critic 使用）。
-
-        简化实现：直接拼接所有局部观测向量。
-        形状：(global_obs_dim,)
-        """
-        local_obs = self._get_obs()
-        return local_obs.flatten()
+        return self._get_obs().flatten()
 
     def _calculate_rewards(
         self,
@@ -296,16 +406,14 @@ class MultiUAVEnv:
         proposed_sizes: np.ndarray,
         delta_progress: np.ndarray,
         completed_now: np.ndarray,
+        active_mask: np.ndarray,
     ) -> np.ndarray:
-        """计算综合奖励：任务奖励 + 安全惩罚 + 效率惩罚。"""
         safe_actions = safe_actions.squeeze(-1)
-
-        # 1. 任务奖励：只奖励进度增量（避免到达后每步持续刷分） + 完成一次性奖励（首次到达阈值）
         weights = self.priorities * self.urgencies
         task_reward = self.task_weight * (weights * np.asarray(delta_progress, dtype=float))
-        completion_reward = self.completion_bonus * (weights * completed_now.astype(float))
-
-        # 2. 安全惩罚：actor 提出的尺寸（冲突解算前）vs 解算后无冲突的 space_sizes，被裁掉则惩罚
+        completion_reward = self.completion_bonus * (
+            weights * completed_now.astype(float)
+        )
         proposed_sizes_clipped = np.clip(
             np.asarray(proposed_sizes, dtype=float).ravel(),
             self.min_space_size,
@@ -313,30 +421,22 @@ class MultiUAVEnv:
         )
         size_reduction = np.abs(proposed_sizes_clipped - self.space_sizes)
         safety_penalty = -self.safety_weight * size_reduction
-
-        # 3. 效率惩罚：鼓励占用较紧凑的空间
         efficiency_penalty = -self.efficiency_weight * self.space_sizes
-
         rewards = task_reward + completion_reward + safety_penalty + efficiency_penalty
-        return rewards.astype(float)
+        rewards = rewards.astype(float)
+        rewards[~active_mask] = 0.0
+        return rewards
 
 
 def test_environment() -> None:
-    """简单测试环境是否正常工作。"""
     env = MultiUAVEnv()
     obs = env.reset()
     print(f"Observation shape: {obs.shape}")
-
-    # 执行随机动作
     actions = np.random.uniform(-1.0, 1.0, (env.n_uavs, 1))
     obs, rewards, done, info = env.step(actions)
-
-    print(f"Rewards: {rewards}")
-    print(f"Space sizes: {env.space_sizes}")
-    assert not np.any(np.isnan(rewards)), "Rewards contain NaN!"
+    print(f"Rewards: {rewards}, done: {done}")
+    assert not np.any(np.isnan(rewards))
 
 
 if __name__ == "__main__":
     test_environment()
-
-

@@ -36,7 +36,18 @@ navigation:
 
 reward_weights:
   task_weight: 1.0
+  completion_bonus: 1.0
   safety_weight: 0
   efficiency_weight: 0
+
+# 任务池 + 规则调度（激活即在任务起点 spawn）。enabled: false 则恢复传统每局固定起点终点。
+task_scheduler:
+  enabled: true
+  initial_tasks: 4            # episode 开局一次性注入任务数（用于初始激活更多 UAV）
+  arrival_every_n_steps: 25   # 每多少环境步到达一批任务
+  tasks_per_arrival: 2
+  margin: 2.0
+  min_seg_len: 3.0
+  # deadline_steps: 200        # 可选：任务进入池后的剩余步数，超时标记 expired
 
 

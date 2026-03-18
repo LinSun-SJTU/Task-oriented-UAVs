@@ -32,6 +32,7 @@ class RolloutBuffer:
         self.dones: List[bool] = []
         self.log_probs: List[float] = []
         self.global_obs: List[np.ndarray] = []
+        self.active: List[float] = []
 
     def add(
         self,
@@ -41,6 +42,7 @@ class RolloutBuffer:
         log_prob: float,
         global_obs: np.ndarray,
         done: bool,
+        active: float = 1.0,
     ) -> None:
         self.obs.append(obs.copy())
         self.actions.append(np.array(action, copy=True))
@@ -48,6 +50,7 @@ class RolloutBuffer:
         self.dones.append(bool(done))
         self.log_probs.append(float(log_prob))
         self.global_obs.append(global_obs.copy())
+        self.active.append(float(active))
 
     def clear(self) -> None:
         self.__init__()
@@ -107,7 +110,9 @@ class MAPPO:
                 next_obs, rewards, done, _ = self.env.step(actions_arr)
 
                 global_obs = self.env._get_global_obs()
+                act = getattr(self.env, "active", None)
                 for i in range(self.env.n_uavs):
+                    ai = 1.0 if act is None else float(act[i])
                     self.buffers[i].add(
                         obs=obs[i],
                         action=actions[i],
@@ -115,6 +120,7 @@ class MAPPO:
                         log_prob=log_probs[i],
                         global_obs=global_obs,
                         done=done,
+                        active=ai,
                     )
 
                 obs = next_obs
@@ -178,6 +184,11 @@ class MAPPO:
                 dtype=torch.float32,
                 device=self.device,
             )
+            active_t = torch.as_tensor(
+                np.array(buffer.active, dtype=np.float32),
+                dtype=torch.float32,
+                device=self.device,
+            )
 
             with torch.no_grad():
                 values = self.critic(global_obs).squeeze(-1).cpu().numpy()
@@ -201,6 +212,7 @@ class MAPPO:
                     "advantages_t": advantages_t,
                     "global_obs": global_obs,
                     "returns_t": returns_t,
+                    "active_t": active_t,
                 }
             )
 
@@ -233,6 +245,7 @@ class MAPPO:
             actions = u["actions"]
             old_log_probs = u["old_log_probs"]
             advantages_t = u["advantages_t"]
+            active_t = u["active_t"]
             actor = self.actors[i]
             actor_opt = self.actor_optimizers[i]
             dataset_size = obs.size(0)
@@ -248,6 +261,10 @@ class MAPPO:
                     batch_actions = actions[batch_idx]
                     batch_old_log_probs = old_log_probs[batch_idx]
                     batch_advantages = advantages_t[batch_idx]
+                    batch_active = active_t[batch_idx]
+                    w = batch_active.sum()
+                    if w < 1e-6:
+                        continue
 
                     dist_now = actor.get_action_distribution(batch_obs)
                     log_probs_now = dist_now.log_prob(batch_actions).sum(dim=-1)
@@ -262,7 +279,8 @@ class MAPPO:
                         )
                         * batch_advantages
                     )
-                    actor_loss = -torch.min(surr1, surr2).mean()
+                    pol = torch.min(surr1, surr2)
+                    actor_loss = -(pol * batch_active).sum() / w
 
                     actor_opt.zero_grad()
                     actor_loss.backward()

@@ -36,6 +36,7 @@ def make_env(cfg: Dict[str, Any]) -> MultiUAVEnv:
             step_size=nav_cfg.get("step_size", 0.5),
         )
 
+    ts = cfg.get("task_scheduler")
     env = MultiUAVEnv(
         n_uavs=env_cfg.get("n_uavs", 5),
         world_size=tuple(env_cfg.get("world_size", [10.0, 10.0, 10.0])),
@@ -49,6 +50,7 @@ def make_env(cfg: Dict[str, Any]) -> MultiUAVEnv:
         safety_weight=rw_cfg.get("safety_weight", 0.5),
         efficiency_weight=rw_cfg.get("efficiency_weight", 0.1),
         navigator=navigator,
+        task_scheduler=ts,
     )
     return env
 
@@ -92,21 +94,33 @@ def run_export_episode(
     """用当前策略跑一个 episode，收集每步每机的状态，返回前端格式的 devices 列表。"""
     devices: List[Dict[str, Any]] = []
     obs = env.reset()
-    prev_positions = env.positions.copy()
+    sched = bool(getattr(env, "task_scheduler_enabled", False))
+    # 每机上次写入 JSON 的位置；调度模式下 inactive 时清空，新任务首帧速度为 0
+    last_exported: List[Any] = [None] * env.n_uavs
 
     for step in range(max_steps):
         ts_ms = base_ts_ms + step * step_interval_ms
         for i in range(env.n_uavs):
+            act = bool(getattr(env, "active", np.ones(env.n_uavs, dtype=bool))[i])
+            if sched and not act:
+                last_exported[i] = None
+                continue
+
             pos = env.positions[i]
             size = env.space_sizes[i]
             p = float(env.priorities[i])
             u = float(env.urgencies[i])
-            uid = f"{i + 1:03d}+{p * u:.2f}"
-            if step == 0:
+            uid = f"{i + 1:03d}"
+            if last_exported[i] is None:
                 vel = [0.0, 0.0, 0.0]
             else:
-                vel = (pos - prev_positions[i]).tolist()
-                vel = [float(vel[0]), float(vel[1]), float(vel[2])]
+                le = last_exported[i]
+                vel = [
+                    float(pos[0] - le[0]),
+                    float(pos[1] - le[1]),
+                    float(pos[2] - le[2]),
+                ]
+            last_exported[i] = pos.copy()
             position_list = [float(pos[0]), float(pos[1]), float(pos[2])]
             include_area = _position_to_include_area(pos, size)
             target_list = [
@@ -114,15 +128,18 @@ def run_export_episode(
                 float(env.target_positions[i][1]),
                 float(env.target_positions[i][2]),
             ]
-            devices.append({
+            rec: Dict[str, Any] = {
                 "uid": uid,
                 "position": position_list,
                 "velocity": vel,
                 "ts": ts_ms,
                 "include_area": include_area,
                 "target_pos": target_list,
-            })
-        prev_positions = env.positions.copy()
+                "task_score": round(p * u, 4),
+            }
+            if sched:
+                rec["active"] = True
+            devices.append(rec)
 
         actions = []
         for i in range(env.n_uavs):
@@ -160,7 +177,8 @@ def train(config_path: str) -> None:
         done = False
         episode_rewards = np.zeros(env.n_uavs, dtype=np.float32)
 
-        for _ in range(max_steps):
+        sched = getattr(env, "task_scheduler_enabled", False)
+        for step_i in range(max_steps):
             actions = []
             log_probs = []
 
@@ -177,21 +195,27 @@ def train(config_path: str) -> None:
             actions_arr = np.stack(actions, axis=0)
             next_obs, rewards, done, _ = env.step(actions_arr)
 
+            done_buf = done or (
+                sched and step_i >= max_steps - 1
+            )
+
             global_obs = env._get_global_obs()
             for i in range(env.n_uavs):
+                ai = float(env.active[i])
                 algo.buffers[i].add(
                     obs=obs[i],
                     action=actions[i],
                     reward=rewards[i],
                     log_prob=log_probs[i],
                     global_obs=global_obs,
-                    done=done,
+                    done=done_buf,
+                    active=ai,
                 )
 
             obs = next_obs
             episode_rewards += rewards
 
-            if done:
+            if done and not sched:
                 break
 
         mean_reward = float(episode_rewards.mean())
